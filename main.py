@@ -40,7 +40,7 @@ class HandTrackerApp:
         ttk.Label(self.top_frame, text="Task:").pack(side=tk.LEFT, padx=(0, 5))
         self.task_var = tk.StringVar()
         self.task_cb = ttk.Combobox(self.top_frame, textvariable=self.task_var, state="readonly")
-        self.task_cb['values'] = ("Track hands", "Magic wand")
+        self.task_cb['values'] = ("Track hands", "Magic wand", "Facial landmarks")
         self.task_cb.current(0)
         self.task_cb.pack(side=tk.LEFT, padx=5)
 
@@ -99,6 +99,22 @@ class HandTrackerApp:
             num_hands=2,
             running_mode=vision.RunningMode.IMAGE)
         self.detector = vision.HandLandmarker.create_from_options(options)
+        
+        # Download Face Landmarker Model
+        face_model_path = 'face_landmarker.task'
+        if not os.path.exists(face_model_path):
+            print("Downloading MediaPipe face landmarker model...")
+            url = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+            urllib.request.urlretrieve(url, face_model_path)
+            
+        face_base_options = python.BaseOptions(model_asset_path=face_model_path)
+        face_options = vision.FaceLandmarkerOptions(
+            base_options=face_base_options,
+            num_faces=1,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+            running_mode=vision.RunningMode.IMAGE)
+        self.face_detector = vision.FaceLandmarker.create_from_options(face_options)
 
     def detect_cameras(self):
         print("Detecting webcams...")
@@ -291,6 +307,35 @@ class HandTrackerApp:
                                 texts_to_draw.append((t1, (w - int(end1[0]) + 10, int(end1[1]) - 15), (255, 100, 100)))
                                 texts_to_draw.append((t2, (w - int(end2[0]) + 10, int(end2[1]) - 15), (0, 255, 255)))
                 
+                elif current_task == "Facial landmarks":
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+                    detection_result = self.face_detector.detect(mp_image)
+                    
+                    if detection_result.face_landmarks:
+                        from mediapipe.tasks.python import vision
+                        tesselation = vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION
+                        h, w, c = image_rgb.shape
+                        for face_landmark in detection_result.face_landmarks:
+                            # Parse out 3D coordinates locally
+                            # First, physically map mesh connection layout
+                            if tesselation is not None:
+                                for connection in tesselation:
+                                    start_idx = connection.start if hasattr(connection, 'start') else connection[0]
+                                    end_idx = connection.end if hasattr(connection, 'end') else connection[1]
+                                    
+                                    start_pt = face_landmark[start_idx]
+                                    end_pt = face_landmark[end_idx]
+                                    
+                                    x1, y1 = int(start_pt.x * w), int(start_pt.y * h)
+                                    x2, y2 = int(end_pt.x * w), int(end_pt.y * h)
+                                    # Very thin lightweight wireframe line
+                                    cv2.line(image_rgb, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                            
+                            # Next drop minimal nodes mapping intersection points accurately
+                            for lm in face_landmark:
+                                cx, cy = int(lm.x * w), int(lm.y * h)
+                                cv2.circle(image_rgb, (cx, cy), 1, (0, 255, 0), -1)
+
                 # Flip image horizontally for a selfie-view display
                 image_rgb = cv2.flip(image_rgb, 1)
 
