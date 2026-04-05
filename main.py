@@ -8,6 +8,9 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import numpy as np
+import time
+from datetime import datetime
+import csv
 
 def get_camera_names():
     """Attempt to use PowerShell to get webcam names on Windows."""
@@ -40,9 +43,10 @@ class HandTrackerApp:
         ttk.Label(self.top_frame, text="Task:").pack(side=tk.LEFT, padx=(0, 5))
         self.task_var = tk.StringVar()
         self.task_cb = ttk.Combobox(self.top_frame, textvariable=self.task_var, state="readonly")
-        self.task_cb['values'] = ("Track hands", "Magic wand", "Facial landmarks")
+        self.task_cb['values'] = ("Track hands", "Magic wand", "Facial landmarks", "Record Facial landmarks")
         self.task_cb.current(0)
         self.task_cb.pack(side=tk.LEFT, padx=5)
+        self.task_var.trace_add('write', self.on_task_changed)
 
         # Camera Selection
         ttk.Label(self.top_frame, text="Camera:").pack(side=tk.LEFT, padx=(20, 5))
@@ -55,15 +59,40 @@ class HandTrackerApp:
         self.quit_btn = ttk.Button(self.top_frame, text="Quit", command=self.on_close)
         self.quit_btn.pack(side=tk.RIGHT, padx=5)
 
+        # Dynamic Recording Frame (Hidden by default)
+        self.record_frame = ttk.Frame(root)
+        
+        ttk.Label(self.record_frame, text="Period (s):").pack(side=tk.LEFT, padx=5)
+        self.period_var = tk.DoubleVar(value=1.0)
+        ttk.Entry(self.record_frame, textvariable=self.period_var, width=5).pack(side=tk.LEFT)
+        
+        ttk.Label(self.record_frame, text="Duration (s):").pack(side=tk.LEFT, padx=5)
+        self.duration_var = tk.DoubleVar(value=60.0)
+        ttk.Entry(self.record_frame, textvariable=self.duration_var, width=5).pack(side=tk.LEFT)
+        
+        self.record_btn_var = tk.StringVar(value="Start Recording")
+        self.record_btn = ttk.Button(self.record_frame, textvariable=self.record_btn_var, command=self.toggle_recording)
+        self.record_btn.pack(side=tk.LEFT, padx=10)
+
+        self.recording_status_var = tk.StringVar(value="")
+        ttk.Label(self.record_frame, textvariable=self.recording_status_var, foreground="red").pack(side=tk.LEFT, padx=5)
+
         # Video Canvas
         self.canvas = tk.Canvas(root, width=640, height=480, bg="black")
-        self.canvas.pack(padx=10, pady=(0, 10))
+        self.canvas.pack(padx=10, pady=(10, 10))
 
         # 3. Detect Cameras
         self.detect_cameras()
 
         self.cap = None
         self.is_running = True
+        
+        # Recording State Initialization
+        self.is_recording_data = False
+        self.record_start_time = 0
+        self.record_duration = 0
+        self.record_period = 0
+        self.next_snapshot_time = 0
         
         # Hand Connections constant
         self.HAND_CONNECTIONS = [
@@ -82,6 +111,45 @@ class HandTrackerApp:
         # Start Video loop
         self.delay = 15 # ms
         self.update_frame()
+
+    def on_task_changed(self, *args):
+        if self.task_var.get() == "Record Facial landmarks":
+            self.record_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5, after=self.top_frame)
+        else:
+            self.record_frame.pack_forget()
+            if self.is_recording_data:
+                self.stop_recording()
+
+    def toggle_recording(self):
+        if not self.is_recording_data:
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        try:
+            self.record_period = float(self.period_var.get())
+            self.record_duration = float(self.duration_var.get())
+        except ValueError:
+            self.recording_status_var.set("Invalid inputs!")
+            return
+            
+        if not os.path.exists('recordings'):
+            os.makedirs('recordings')
+            
+        self.is_recording_data = True
+        self.record_start_time = time.time()
+        self.next_snapshot_time = self.record_start_time
+        
+        self.record_btn_var.set("Stop Recording")
+        self.recording_status_var.set(f"Recording Active...")
+        print(f"Started facial data recording for {self.record_duration}s triggering every {self.record_period}s.")
+
+    def stop_recording(self):
+        self.is_recording_data = False
+        self.record_btn_var.set("Start Recording")
+        self.recording_status_var.set("Recording Finished")
+        print("Facial data recording stopped.")
 
     def init_mediapipe(self):
         model_path = 'hand_landmarker.task'
@@ -150,6 +218,9 @@ class HandTrackerApp:
         if self.is_running and self.cap is not None and self.cap.isOpened():
             success, image = self.cap.read()
             if success:
+                # Raw image baseline copy before ANY drawings act on it
+                raw_image = image.copy()
+                
                 # Get selected task in case we branch later
                 current_task = self.task_var.get()
 
@@ -307,7 +378,7 @@ class HandTrackerApp:
                                 texts_to_draw.append((t1, (w - int(end1[0]) + 10, int(end1[1]) - 15), (255, 100, 100)))
                                 texts_to_draw.append((t2, (w - int(end2[0]) + 10, int(end2[1]) - 15), (0, 255, 255)))
                 
-                elif current_task == "Facial landmarks":
+                elif current_task in ["Facial landmarks", "Record Facial landmarks"]:
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
                     detection_result = self.face_detector.detect(mp_image)
                     
@@ -315,26 +386,62 @@ class HandTrackerApp:
                         from mediapipe.tasks.python import vision
                         tesselation = vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION
                         h, w, c = image_rgb.shape
-                        for face_landmark in detection_result.face_landmarks:
-                            # Parse out 3D coordinates locally
-                            # First, physically map mesh connection layout
-                            if tesselation is not None:
-                                for connection in tesselation:
-                                    start_idx = connection.start if hasattr(connection, 'start') else connection[0]
-                                    end_idx = connection.end if hasattr(connection, 'end') else connection[1]
-                                    
-                                    start_pt = face_landmark[start_idx]
-                                    end_pt = face_landmark[end_idx]
-                                    
-                                    x1, y1 = int(start_pt.x * w), int(start_pt.y * h)
-                                    x2, y2 = int(end_pt.x * w), int(end_pt.y * h)
-                                    # Very thin lightweight wireframe line
-                                    cv2.line(image_rgb, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                        
+                        # Assume targeting the primary face
+                        primary_face = detection_result.face_landmarks[0]
+                        
+                        # --- ASYNC DATA RECORDING LOOP ---
+                        if current_task == "Record Facial landmarks" and self.is_recording_data:
+                            current_time = time.time()
                             
-                            # Next drop minimal nodes mapping intersection points accurately
-                            for lm in face_landmark:
-                                cx, cy = int(lm.x * w), int(lm.y * h)
-                                cv2.circle(image_rgb, (cx, cy), 1, (0, 255, 0), -1)
+                            # Evaluate duration boundary
+                            if current_time >= self.record_start_time + self.record_duration:
+                                self.stop_recording()
+                                self.recording_status_var.set("Successfully Hit Target Duration.")
+                            elif current_time >= self.next_snapshot_time:
+                                # Synchronize next target window (self-correcting for micro-drifts)
+                                self.next_snapshot_time += self.record_period
+                                
+                                timestamp_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                                
+                                # Dump 3x478 raw coordinates format strictly via CSV spec output (X,Y,Z looping sequentially)
+                                row_data = []
+                                for lm in primary_face:
+                                    row_data.extend([lm.x, lm.y, lm.z])
+                                    
+                                csv_path = os.path.join('recordings', f"{timestamp_id}.csv")
+                                with open(csv_path, 'w', newline='') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow(row_data)
+                                    
+                                # Resize and natively save matching RAW unmarked un-flipped JPG (320 X 240)
+                                raw_small = cv2.resize(raw_image, (320, 240))
+                                img_path = os.path.join('recordings', f"{timestamp_id}.jpg")
+                                cv2.imwrite(img_path, raw_small)
+                                
+                                # Give the HUD an indicator that a successful snap fired (top corner ping)
+                                texts_to_draw.append((f"[REC SNAPSHOT OVERWRITTEN: {timestamp_id}]", (w - 300, 30), (0, 0, 255)))
+
+                        # --- LIVE UI RENDER LOOP (Option B) ---
+                        # Parse out 3D coordinates natively
+                        # First, physically map mesh contiguous connections
+                        if tesselation is not None:
+                            for connection in tesselation:
+                                start_idx = connection.start if hasattr(connection, 'start') else connection[0]
+                                end_idx = connection.end if hasattr(connection, 'end') else connection[1]
+                                
+                                start_pt = primary_face[start_idx]
+                                end_pt = primary_face[end_idx]
+                                
+                                x1, y1 = int(start_pt.x * w), int(start_pt.y * h)
+                                x2, y2 = int(end_pt.x * w), int(end_pt.y * h)
+                                # Very thin lightweight wireframe line
+                                cv2.line(image_rgb, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                        
+                        # Next drop minimal nodes mapping intersection landmarks accurately
+                        for lm in primary_face:
+                            cx, cy = int(lm.x * w), int(lm.y * h)
+                            cv2.circle(image_rgb, (cx, cy), 1, (0, 255, 0), -1)
 
                 # Flip image horizontally for a selfie-view display
                 image_rgb = cv2.flip(image_rgb, 1)
@@ -358,6 +465,7 @@ class HandTrackerApp:
         if self.cap is not None:
             self.cap.release()
         self.detector.close()
+        self.face_detector.close()
         self.root.destroy()
 
 def main():
